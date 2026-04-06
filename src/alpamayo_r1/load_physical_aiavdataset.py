@@ -15,6 +15,8 @@
 
 """Load data from physical_ai_av.PhysicalAIAVDatasetInterface for model inference."""
 
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -22,6 +24,11 @@ import physical_ai_av
 import scipy.spatial.transform as spt
 import torch
 from einops import rearrange
+
+# The dataset repo `main` branch removed `metadata/sensor_presence.parquet` (replaced by
+# `feature_presence.parquet`). Released `physical_ai_av` still expects the old layout.
+# This commit is the last on `main` (ancestor) that still provides `sensor_presence.parquet`.
+PHYSICAL_AI_AV_DEFAULT_DATASET_REVISION = "05e158af89ba2dba93cd315c71fa6a0d0ea1a633"
 
 
 def load_physical_aiavdataset(
@@ -34,6 +41,12 @@ def load_physical_aiavdataset(
     time_step: float = 0.1,
     camera_features: list | None = None,
     num_frames: int = 4,
+    *,
+    token: str | bool | None = None,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_dir: str | Path | None = None,
+    return_avdi: bool = False,
 ) -> dict[str, Any]:
     """Load data from physical_ai_av for model inference.
 
@@ -45,6 +58,13 @@ def load_physical_aiavdataset(
         t0_us: The timestamp (in microseconds) at which to sample the trajectory.
             If None, uses a timestamp 5.1s seconds into the clip.
         avdi: Optional pre-initialized PhysicalAIAVDatasetInterface. If None, creates one.
+        token: Hugging Face token (gated dataset). If None, uses ``HF_TOKEN`` when set, else hub default.
+        revision: Repo revision. If None, uses ``PHYSICAL_AI_AV_REVISION`` env or a commit compatible
+            with the installed ``physical_ai_av`` (``main`` removed ``metadata/sensor_presence.parquet``).
+        cache_dir: Optional Hugging Face cache directory.
+        local_dir: Optional download directory (see ``physical_ai_av`` docs).
+        return_avdi: If True, include ``avdi`` (dataset interface) and ``camera_features_ordered``
+            (feature id per row of ``image_frames``, after camera-index sort) for full-clip decode.
         maybe_stream: Whether to stream data from HuggingFace (if not downloaded locally).
         num_history_steps: Number of history trajectory steps (default: 16 for 1.6s at 10Hz).
         num_future_steps: Number of future trajectory steps (default: 64 for 6.4s at 10Hz).
@@ -66,9 +86,43 @@ def load_physical_aiavdataset(
             - absolute_timestamps: torch.Tensor of shape (N_cameras, num_frames)
             - t0_us: The t0 timestamp used
             - clip_id: The clip ID
+            - avdi: (only if ``return_avdi``) The ``PhysicalAIAVDatasetInterface`` instance.
+            - camera_features_ordered: (only if ``return_avdi``) List of camera feature strings
+              aligned with ``image_frames`` rows (same order as ``camera_indices`` sort).
     """
     if avdi is None:
-        avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+        eff_token: str | bool | None = token
+        if eff_token is None:
+            env_tok = os.environ.get("HF_TOKEN", "").strip()
+            if env_tok:
+                eff_token = env_tok
+        iface_kw: dict[str, Any] = {}
+        if eff_token is not None:
+            iface_kw["token"] = eff_token
+        if revision is not None:
+            iface_kw["revision"] = revision
+        else:
+            env_rev = os.environ.get("PHYSICAL_AI_AV_REVISION", "").strip()
+            iface_kw["revision"] = env_rev or PHYSICAL_AI_AV_DEFAULT_DATASET_REVISION
+        if cache_dir is not None:
+            iface_kw["cache_dir"] = cache_dir
+        if local_dir is not None:
+            iface_kw["local_dir"] = local_dir
+        try:
+            avdi = physical_ai_av.PhysicalAIAVDatasetInterface(**iface_kw)
+        except IndexError as e:
+            raise RuntimeError(
+                "Could not reach file metadata on Hugging Face for dataset "
+                "'nvidia/PhysicalAI-Autonomous-Vehicles' (empty path info for a required path).\n\n"
+                "Common causes:\n"
+                "  • Not logged in / gated dataset: `hf auth login` or HF_TOKEN, and accept terms on "
+                "the dataset page.\n"
+                "  • Dataset layout newer than `physical_ai_av`: `main` dropped "
+                "`metadata/sensor_presence.parquet`. This loader defaults to revision "
+                f"{PHYSICAL_AI_AV_DEFAULT_DATASET_REVISION[:12]}…; set PHYSICAL_AI_AV_REVISION or "
+                "pass revision=, or upgrade `physical_ai_av`.\n"
+                "  • Fine-grained token: grant read access to this dataset repo."
+            ) from e
 
     if camera_features is None:
         camera_features = [
@@ -200,12 +254,13 @@ def load_physical_aiavdataset(
     image_frames = image_frames[sort_order]
     camera_indices = camera_indices[sort_order]
     all_timestamps = all_timestamps[sort_order]
+    camera_features_ordered = [camera_features[i] for i in sort_order.tolist()]
 
     # Compute relative timestamps in seconds
     camera_tmin = all_timestamps.min()
     relative_timestamps = (all_timestamps - camera_tmin).float() * 1e-6  # (N_cameras, num_frames)
 
-    return {
+    out: dict[str, Any] = {
         "image_frames": image_frames,  # (N_cameras, num_frames, 3, H, W)
         "camera_indices": camera_indices,  # (N_cameras,)
         "ego_history_xyz": ego_history_xyz_tensor,  # (1, 1, num_history_steps, 3)
@@ -217,3 +272,7 @@ def load_physical_aiavdataset(
         "t0_us": t0_us,
         "clip_id": clip_id,
     }
+    if return_avdi:
+        out["avdi"] = avdi
+        out["camera_features_ordered"] = camera_features_ordered
+    return out
