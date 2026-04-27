@@ -23,7 +23,10 @@ from matplotlib.figure import Figure
 from PIL import Image, ImageDraw, ImageFont
 
 from alpamayo_r1 import helper
-from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
+from alpamayo_r1.load_physical_aiavdataset import (
+    load_physical_aiavdataset,
+    physical_ai_av_interface,
+)
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 
 
@@ -303,22 +306,36 @@ def save_standalone_artifacts(
     (artifact_dir / "cot.txt").write_text("".join(lines), encoding="utf-8")
     print(f"Artifacts: {artifact_dir / 'bev.mp4'} , {artifact_dir / 'cot.txt'}")
 
-def load_clip_ids() -> dict:
+def load_clip_ids(avdi=None) -> list[str]:
+    """Resolve short IDs via PAI_REASON.txt; optionally keep only clips in the dataset ``clip_index``."""
     all_clip_ids_path = "/home/bcostarendon/data/PAI_REASON.txt"
     all_clip_ids = []
     with open(all_clip_ids_path, "r") as f:
         for line in f:
             all_clip_ids.append(line.strip())
     selected_clips_path = "/home/bcostarendon/data/selected_clip_ids.txt"
-    selected_clip_ids = []
+    selected_clip_ids: list[str] = []
     with open(selected_clips_path, "r") as f:
         for line in f:
             line = line.strip()
+            if not line:
+                continue
             for full_clip_id in all_clip_ids:
                 if line in full_clip_id:
                     selected_clip_ids.append(full_clip_id)
                     break
-    print(f"Found {len(selected_clip_ids)} selected clip ids")
+    print(f"Found {len(selected_clip_ids)} selected clip ids (from prefix match)")
+    if avdi is not None:
+        valid = set(avdi.clip_index.index.astype(str))
+        ok = [c for c in selected_clip_ids if c in valid]
+        for c in selected_clip_ids:
+            if c not in valid:
+                print(
+                    f"Skipping {c!r}: not in Physical AI AV clip_index for this "
+                    "revision (PAI_REASON / selection list can include other corpora or dropped clips)."
+                )
+        print(f"After clip_index filter: {len(ok)} clips")
+        return ok
     return selected_clip_ids
 
 def run_alpamayo_inference(
@@ -420,18 +437,6 @@ def main() -> None:
         help="Output video FPS (default: native camera FPS for full clip, 10 for --model-frames-only)",
     )
     parser.add_argument(
-        "--decode-batch-size",
-        type=int,
-        default=48,
-        help="How many frames to decode at once from disk (full-clip mode; lower uses less RAM)",
-    )
-    parser.add_argument(
-        "--artifacts-dir",
-        type=str,
-        default=None,
-        help="Directory for standalone bev.mp4 and cot.txt (default: <output-video-stem>_artifacts/)",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Short smoke test",
@@ -446,9 +451,19 @@ def main() -> None:
             f"[debug] max_frames={max_frames}"
         )
 
-    # Load clip ids
-    clip_ids = load_clip_ids()
-    for clip_id in clip_ids:
+    # Load clip ids (filter to HF dataset revision so clip_index lookup cannot KeyError)
+    avdi_catalog = physical_ai_av_interface(token=os.environ.get("HF_TOKEN"))
+    #clip_ids = load_clip_ids(avdi_catalog)
+
+    clip_ids = []
+    with open("500_clip_ids.txt", "r") as f:
+        for line in f:
+            clip_ids.append(line.strip())
+
+    for i, clip_id in enumerate(clip_ids):
+        if os.path.exists(os.path.join(args.output, clip_id)):
+            continue
+
         print(f"Processing clip {clip_id}")
         model = AlpamayoR1.from_pretrained(
             "nvidia/Alpamayo-R1-10B", 
@@ -457,16 +472,20 @@ def main() -> None:
         processor = helper.get_processor(model.tokenizer)
         torch.cuda.manual_seed_all(42)
 
-        (
-            out_frames,
-            bev_frames,
-            cot_segments,
-        ) = run_alpamayo_inference(
-            clip_id,
-            model,
-            processor,
-            max_frames,
-        )
+        try:
+            (
+                out_frames,
+                bev_frames,
+                cot_segments,
+            ) = run_alpamayo_inference(
+                clip_id,
+                model,
+                processor,
+                max_frames,
+            )
+        except Exception as e:
+            print(f"Error processing clip {clip_id}: {e}")
+            continue
 
         os.makedirs(os.path.join(args.output, clip_id), exist_ok=True)
         output_video = os.path.join(args.output, clip_id, f"{clip_id}.mp4")
